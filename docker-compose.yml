@@ -1,0 +1,68 @@
+# Local / single-host deployment. For production, run Postgres and Redis as managed services,
+# terminate TLS in front of `web`, and set COOKIE_SECURE=true.
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: crm
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-crm}
+      POSTGRES_DB: crm_architect
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U crm -d crm_architect"]
+      interval: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 10
+
+  migrate:
+    build: ./backend
+    env_file: [{ path: .env, required: false }]
+    environment: &backend-env
+      DATABASE_URL: postgresql+asyncpg://crm:${POSTGRES_PASSWORD:-crm}@db:5432/crm_architect
+      REDIS_URL: redis://redis:6379/0
+      JOB_BACKEND: arq
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      db: { condition: service_healthy }
+
+  api:
+    build: ./backend
+    env_file: [{ path: .env, required: false }]
+    environment: *backend-env
+    volumes: [files:/data]
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')"]
+      interval: 10s
+      retries: 5
+
+  worker:
+    build: ./backend
+    env_file: [{ path: .env, required: false }]
+    environment: *backend-env
+    volumes: [files:/data]
+    command: ["arq", "app.worker.WorkerSettings"]
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+
+  web:
+    build:
+      context: ./frontend
+      args:
+        API_URL: http://api:8000
+    ports: ["${WEB_PORT:-3000}:3000"]
+    depends_on:
+      api: { condition: service_healthy }
+
+volumes:
+  pgdata:
+  files:
